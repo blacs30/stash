@@ -28,7 +28,6 @@ import (
 	"stash.appscode.dev/apimachinery/pkg/invoker"
 	"stash.appscode.dev/apimachinery/pkg/metrics"
 	"stash.appscode.dev/apimachinery/pkg/restic"
-	"stash.appscode.dev/stash/pkg/eventer"
 	"stash.appscode.dev/stash/pkg/status"
 	"stash.appscode.dev/stash/pkg/util"
 
@@ -36,8 +35,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/leaderelection"
-	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"k8s.io/klog/v2"
 	kmapi "kmodules.xyz/client-go/api/v1"
 	"kmodules.xyz/client-go/meta"
@@ -83,53 +80,15 @@ func (opt *Options) Restore(inv invoker.RestoreInvoker, targetInfo invoker.Resto
 func (opt *Options) electRestoreLeader(inv invoker.RestoreInvoker, targetInfo invoker.RestoreTargetInfo) error {
 	klog.Infoln("Attempting to elect restore leader")
 
-	rlc := resourcelock.ResourceLockConfig{
-		Identity:      meta.PodName(),
-		EventRecorder: eventer.NewEventRecorder(opt.KubeClient, eventer.EventSourceRestoreInitContainer),
-	}
-
-	resLock, err := resourcelock.New(
-		resourcelock.ConfigMapsResourceLock,
-		inv.GetObjectMeta().Namespace,
-		util.GetRestoreConfigmapLockName(targetInfo.Target.Ref),
-		opt.KubeClient.CoreV1(),
-		opt.KubeClient.CoordinationV1(),
-		rlc,
-	)
+	klog.Infoln("Peparing for restore")
+	// run restore process
+	err := opt.restoreHost(inv, targetInfo)
 	if err != nil {
-		return fmt.Errorf("error during leader election: %s", err)
+		// fail the container so that it restart and re-try to restore
+		klog.Fatalf("failed to complete restore. Reason: %v", err)
+		// step down from leadership so that other replicas try to restore
+		return err
 	}
-
-	// use a Go context so we can tell the leader election code when we
-	// want to step down
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// start the leader election code loop
-	leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
-		Lock:          resLock,
-		LeaseDuration: 15 * time.Second,
-		RenewDeadline: 10 * time.Second,
-		RetryPeriod:   2 * time.Second,
-		Callbacks: leaderelection.LeaderCallbacks{
-			OnStartedLeading: func(ctx context.Context) {
-				klog.Infoln("Got leadership, preparing for restore")
-				// run restore process
-				err := opt.restoreHost(inv, targetInfo)
-				if err != nil {
-					// step down from leadership so that other replicas try to restore
-					cancel()
-					// fail the container so that it restart and re-try to restore
-					klog.Fatalf("failed to complete restore. Reason: %v", err)
-				}
-				// restore process is complete. now, step down from leadership so that other replicas can start
-				cancel()
-			},
-			OnStoppedLeading: func() {
-				klog.Infoln("Lost leadership")
-			},
-		},
-	})
 	return nil
 }
 
@@ -212,12 +171,7 @@ func (opt *Options) runRestore(inv invoker.RestoreInvoker, targetInfo invoker.Re
 
 	// if already restored for this host then don't process further
 	if opt.isRestoredForThisHost(inv, targetInfo, opt.Host) {
-		klog.Infof("Skipping restore for %s %s/%s. Reason: restore already completed for host %q.",
-			inv.GetTypeMeta().Kind,
-			inv.GetObjectMeta().Namespace,
-			inv.GetObjectMeta().Name,
-			opt.Host,
-		)
+		klog.Infof("Skipping restore for %s %s/%s. Reason: restore already completed for host %q.", inv.GetTypeMeta().Kind, inv.GetObjectMeta().Namespace, inv.GetObjectMeta().Name, opt.Host)
 		return nil, nil
 	}
 
